@@ -94,13 +94,13 @@ __global__ void convolveHoriz_Optimized(
   int ncols, int nrows,
   int kernel_width)
 {
-  const int radius = kernel_width / 2;
+ const int radius = kernel_width / 2;
   const int tile_width = blockDim.x;
   const int tile_height = blockDim.y;
   
-  // Shared memory: [tile_height][tile_width + 2*radius + 1]
-  // +1 for bank conflict avoidance
-  const int tile_stride = tile_width + 2 * radius + 1;
+  // Shared memory with 8-byte padding for bank conflict avoidance
+  // T4: 32 banks, 4-byte words → 8-byte padding = 2 words
+  const int tile_stride = tile_width + 2 * radius + 8;  // +8 for padding
   extern __shared__ float s_tile[];
   
   const int tx = threadIdx.x;
@@ -110,63 +110,79 @@ __global__ void convolveHoriz_Optimized(
   
   if (gy >= nrows) return;
   
-  // Cooperative loading with conditional float4
+  // ============ PHASE 1: COOPERATIVE TILE LOADING ============
   const int tile_start_col = blockIdx.x * tile_width - radius;
+  const int total_cols = tile_width + 2 * radius;
   
+  // Each warp loads one row cooperatively
   for (int row = ty; row < tile_height; row += tile_height) {
     int global_row = blockIdx.y * tile_height + row;
     if (global_row >= nrows) continue;
     
     const float* row_ptr = &imgin[global_row * ncols];
+    float* s_row = &s_tile[row * tile_stride];
     
-    // Each thread loads elements with stride = tile_width
-    for (int local_col = tx; local_col < tile_stride; local_col += tile_width) {
-      int global_col = tile_start_col + local_col;
+    // VECTORIZED LOAD: Process 4 floats at a time
+    int vec_loads = (total_cols) / 4;
+    for (int v = tx; v < vec_loads; v += tile_width) {
+      int global_col = tile_start_col + v * 4;
       
-      // Try float4 if aligned and in bounds
-      if ((global_col % 4 == 0) &&  // 4-aligned column
-          (global_col >= 0) && 
-          (global_col + 3 < ncols) &&
-          (local_col + 3 < tile_stride)) {
-        
-        // Safe float4 load
-        float4 data = reinterpret_cast<const float4*>(&row_ptr[global_col])[0];
-        s_tile[row * tile_stride + local_col + 0] = data.x;
-        s_tile[row * tile_stride + local_col + 1] = data.y;
-        s_tile[row * tile_stride + local_col + 2] = data.z;
-        s_tile[row * tile_stride + local_col + 3] = data.w;
-        
-        // Note: We still iterate with stride=tile_width, so next iteration
-        // will handle the next set. This may overlap but that's fine.
+      // Check if entire float4 is in bounds
+      if (global_col >= 0 && global_col + 3 < ncols) {
+        // Aligned vectorized load
+        float4 data = __ldg((const float4*)(&row_ptr[global_col]));
+        s_row[v * 4 + 0] = data.x;
+        s_row[v * 4 + 1] = data.y;
+        s_row[v * 4 + 2] = data.z;
+        s_row[v * 4 + 3] = data.w;
       } else {
-        // Scalar fallback for boundaries or misalignment
-        float val = 0.0f;
-        if (global_col >= 0 && global_col < ncols) {
-          val = row_ptr[global_col];
+        // Boundary handling - scalar loads with bounds check
+        for (int i = 0; i < 4; i++) {
+          int col = global_col + i;
+          s_row[v * 4 + i] = (col >= 0 && col < ncols) ? row_ptr[col] : 0.0f;
         }
-        s_tile[row * tile_stride + local_col] = val;
       }
+    }
+    
+    // SCALAR LOAD: Handle remaining elements
+    int remaining_start = vec_loads * 4;
+    for (int local_col = remaining_start + tx; local_col < total_cols; local_col += tile_width) {
+      int global_col = tile_start_col + local_col;
+      s_row[local_col] = (global_col >= 0 && global_col < ncols) ? 
+                          row_ptr[global_col] : 0.0f;
     }
   }
   __syncthreads();
   
-  // Compute convolution
+  // ============ PHASE 2: COMPUTE CONVOLUTION ============
   if (gx >= ncols) return;
   
-  // Zero boundaries
+  // Zero boundary pixels
   if (gx < radius || gx >= ncols - radius) {
     imgout[gy * ncols + gx] = 0.0f;
     return;
   }
   
-  // Convolve
+  // Convolution with aggressive unrolling
   float sum = 0.0f;
   int s_center = ty * tile_stride + tx + radius;
   
-  #pragma unroll 8
-  for (int k = kernel_width - 1; k >= 0; k--) {
-    int offset = kernel_width - 1 - k;
-    sum += s_tile[s_center - radius + offset] * c_kernel[k];
+  // Unroll based on typical kernel sizes
+  if (kernel_width <= 7) {
+    #pragma unroll
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[s_center - radius + k] * c_kernel[k];
+    }
+  } else if (kernel_width <= 15) {
+    #pragma unroll 4
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[s_center - radius + k] * c_kernel[k];
+    }
+  } else {
+    #pragma unroll 2
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[s_center - radius + k] * c_kernel[k];
+    }
   }
   
   imgout[gy * ncols + gx] = sum;
@@ -185,9 +201,8 @@ __global__ void convolveVert_Optimized(
   const int tile_width = blockDim.x;
   const int tile_height = blockDim.y;
   
-  // Shared memory: [tile_height + 2*radius][tile_width + 1]
-  // +1 for bank conflict avoidance
-  const int tile_stride = tile_width + 1;
+  // Shared memory layout: [tile_height + 2*radius][tile_width + 8]
+  const int tile_stride = tile_width + 8;  // Padding for bank conflicts
   const int tile_vert = tile_height + 2 * radius;
   extern __shared__ float s_tile[];
   
@@ -198,38 +213,51 @@ __global__ void convolveVert_Optimized(
   
   if (gx >= ncols) return;
   
-  // Cooperative loading
+  // ============ PHASE 1: LOAD TILE ============
   const int tile_start_row = blockIdx.y * tile_height - radius;
   
-  // Each thread loads a column of data
+  // Each thread loads a vertical strip
+  // Try to vectorize: load 4 rows at a time if possible
   for (int local_row = ty; local_row < tile_vert; local_row += tile_height) {
     int global_row = tile_start_row + local_row;
     
     float val = 0.0f;
     if (global_row >= 0 && global_row < nrows && gx < ncols) {
-      val = imgin[global_row * ncols + gx];
+      // Use __ldg for read-only cache
+      val = __ldg(&imgin[global_row * ncols + gx]);
     }
     s_tile[local_row * tile_stride + tx] = val;
   }
   __syncthreads();
   
-  // Compute convolution
+  // ============ PHASE 2: COMPUTE CONVOLUTION ============
   if (gy >= nrows) return;
   
-  // Zero boundaries
+  // Zero boundary pixels
   if (gy < radius || gy >= nrows - radius) {
     imgout[gy * ncols + gx] = 0.0f;
     return;
   }
   
-  // Convolve
+  // Convolution with aggressive unrolling
   float sum = 0.0f;
   int s_center_row = ty + radius;
   
-  #pragma unroll 8
-  for (int k = kernel_width - 1; k >= 0; k--) {
-    int offset = kernel_width - 1 - k;
-    sum += s_tile[(s_center_row - radius + offset) * tile_stride + tx] * c_kernel[k];
+  if (kernel_width <= 7) {
+    #pragma unroll
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[(s_center_row - radius + k) * tile_stride + tx] * c_kernel[k];
+    }
+  } else if (kernel_width <= 15) {
+    #pragma unroll 4
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[(s_center_row - radius + k) * tile_stride + tx] * c_kernel[k];
+    }
+  } else {
+    #pragma unroll 2
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[(s_center_row - radius + k) * tile_stride + tx] * c_kernel[k];
+    }
   }
   
   imgout[gy * ncols + gx] = sum;
