@@ -125,13 +125,16 @@ __global__ void convolveHoriz_Optimized(
     // VECTORIZED LOAD: Process 4 floats at a time
     int vec_loads = (total_cols) / 4;
     for (int v = tx; v < vec_loads; v += tile_width) {
-      int global_col = tile_start_col + v * 4;
-      
-      // Check if entire float4 is in bounds
-      if (global_col >= 0 && global_col + 3 < ncols &&
-		 ((size_t)&row_ptr[global_col] % 16 == 0)) {
+	  int global_col = tile_start_col + v * 4;
+	  int local_start = v * 4;
+	  
+	  // ADD THIS LINE:
+	  if (local_start + 3 >= tile_stride) break;  // ← Prevent shared memory overflow
+	  
+	  if (global_col >= 0 && global_col + 3 < ncols &&
+	      ((size_t)&row_ptr[global_col] % 16 == 0)) {
         // Aligned vectorized load
-        float4 data = __ldg((const float4*)(&row_ptr[global_col]));
+		float4 data = __ldg((const float4*)(&row_ptr[global_col]));
         s_row[v * 4 + 0] = data.x;
         s_row[v * 4 + 1] = data.y;
         s_row[v * 4 + 2] = data.z;
@@ -225,7 +228,7 @@ __global__ void convolveVert_Optimized(
     float val = 0.0f;
     if (global_row >= 0 && global_row < nrows && gx < ncols) {
       // Use __ldg for read-only cache
-      val = __ldg(&imgin[global_row * ncols + gx]);
+		val = imgin[global_row * ncols + gx];
     }
     s_tile[local_row * tile_stride + tx] = val;
   }
