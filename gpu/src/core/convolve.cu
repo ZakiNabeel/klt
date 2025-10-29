@@ -84,11 +84,6 @@ static struct {
 }
  
 /*********************************************************************
- * TILE SIZE FOR FUSED VERTICAL KERNEL
- *********************************************************************/
-#define TILE_DIM 32
-
-/*********************************************************************
  * OPTIMIZED HORIZONTAL CONVOLUTION
  *********************************************************************/
 __global__ void convolveHoriz_Optimized(
@@ -168,101 +163,79 @@ __global__ void convolveHoriz_Optimized(
  }
  
 /*********************************************************************
- * FUSED VERTICAL CONVOLUTION WITH LOCAL TRANSPOSE
+ * OPTIMIZED VERTICAL CONVOLUTION
  * 
- * Single kernel that does everything in shared memory:
- * 1. Load tile from global memory
- * 2. Transpose in shared memory (fast!)
- * 3. Apply horizontal convolution to transposed data
- * 4. Transpose result back in shared memory
- * 5. Write to global memory
- * 
- * ALL transposes happen in shared memory - much faster than 3 kernels!
+ * Uses strided access but with shared memory caching to hide latency
+ * Simple and effective - sometimes the straightforward approach wins!
  *********************************************************************/
-__global__ void convolveVert_FusedTranspose(
+__global__ void convolveVert_Optimized(
   const float * __restrict__ imgin,
   float * __restrict__ imgout,
   int ncols, int nrows,
   int kernel_width)
 {
   const int radius = kernel_width / 2;
+  const int tile_width = blockDim.x;
+  const int tile_height = blockDim.y;
   
-  // Shared memory tiles for input, transposed, and output
-  // We use two tiles to avoid conflicts
-  extern __shared__ float s_mem[];
-  float* s_tile = s_mem;                           // First tile for load/transpose
-  float* s_conv = s_mem + (TILE_DIM + 2*radius) * (TILE_DIM + 2*radius + 8);  // Second for convolution
+  // Shared memory layout: [tile_height + 2*radius][tile_width + 8]
+  const int tile_stride = tile_width + 8;  // Padding for bank conflicts
+  const int tile_vert = tile_height + 2 * radius;
+  extern __shared__ float s_tile[];
   
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
-  const int bx = blockIdx.x * TILE_DIM;
-  const int by = blockIdx.y * TILE_DIM;
+  const int gx = blockIdx.x * tile_width + tx;
+  const int gy = blockIdx.y * tile_height + ty;
   
-  // ============ STEP 1: LOAD TILE WITH HALO ============
-  // We need to load TILE_DIM + 2*radius rows
-  const int tile_height = TILE_DIM + 2 * radius;
+  if (gx >= ncols) return;
   
-  for (int local_row = ty; local_row < tile_height; local_row += TILE_DIM) {
-    for (int local_col = tx; local_col < TILE_DIM; local_col += TILE_DIM) {
-      int global_row = by + local_row - radius;
-      int global_col = bx + local_col;
-      
-      float val = 0.0f;
-      if (global_row >= 0 && global_row < nrows && global_col >= 0 && global_col < ncols) {
-        val = imgin[global_row * ncols + global_col];
-      }
-      s_tile[local_row * TILE_DIM + local_col] = val;
-    }
-  }
-  __syncthreads();
+  // ============ PHASE 1: LOAD TILE ============
+  const int tile_start_row = blockIdx.y * tile_height - radius;
   
-  // ============ STEP 2: TRANSPOSE IN SHARED MEMORY ============
-  // Transpose: rows become columns
-  // After transpose, what was a vertical strip is now a horizontal strip
-  if (tx < TILE_DIM && ty < TILE_DIM) {
-    for (int k = 0; k < tile_height; k++) {
-      int src_idx = k * TILE_DIM + ty;
-      int dst_idx = ty * tile_height + k;
-      s_conv[dst_idx] = s_tile[src_idx];
-    }
-  }
-  __syncthreads();
-  
-  // ============ STEP 3: HORIZONTAL CONVOLUTION ON TRANSPOSED DATA ============
-  if (tx < TILE_DIM && ty < TILE_DIM) {
-    int conv_col = ty;
-    int conv_row = tx;
+  // Each thread loads a vertical strip
+  for (int local_row = ty; local_row < tile_vert; local_row += tile_height) {
+    int global_row = tile_start_row + local_row;
     
-    // Check boundaries (remember dimensions are swapped)
-    if (conv_col < radius || conv_col >= TILE_DIM - radius) {
-      // Will write zero later
-    } else {
-      float sum = 0.0f;
-      int center = conv_row * tile_height + conv_col + radius;
-      
-      #pragma unroll
-      for (int k = 0; k < kernel_width && k < 15; k++) {
-        sum += s_conv[center - radius + k] * c_kernel[k];
-      }
-      
-      // Store result back in s_tile (reusing memory)
-      s_tile[tx * TILE_DIM + ty] = sum;
+    float val = 0.0f;
+    if (global_row >= 0 && global_row < nrows && gx < ncols) {
+      val = imgin[global_row * ncols + gx];
     }
+    s_tile[local_row * tile_stride + tx] = val;
   }
   __syncthreads();
   
-  // ============ STEP 4: WRITE RESULT ============
-  int global_row = by + ty;
-  int global_col = bx + tx;
+  // ============ PHASE 2: COMPUTE CONVOLUTION ============
+  if (gy >= nrows) return;
   
-  if (global_row < nrows && global_col < ncols) {
-    // Apply boundary conditions
-    if (global_row < radius || global_row >= nrows - radius) {
-      imgout[global_row * ncols + global_col] = 0.0f;
-    } else {
-      imgout[global_row * ncols + global_col] = s_tile[ty * TILE_DIM + tx];
+  // Zero boundary pixels
+  if (gy < radius || gy >= nrows - radius) {
+    imgout[gy * ncols + gx] = 0.0f;
+    return;
+  }
+  
+  // Convolution with aggressive unrolling
+  float sum = 0.0f;
+  int s_center_row = ty + radius;
+  
+  if (kernel_width <= 7) {
+    #pragma unroll
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[(s_center_row - radius + k) * tile_stride + tx] * c_kernel[k];
+    }
+  } else if (kernel_width <= 15) {
+    #pragma unroll 4
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[(s_center_row - radius + k) * tile_stride + tx] * c_kernel[k];
+    }
+  } else {
+    #pragma unroll 2
+    for (int k = 0; k < kernel_width; k++) {
+      sum += s_tile[(s_center_row - radius + k) * tile_stride + tx] * c_kernel[k];
     }
   }
+  
+  imgout[gy * ncols + gx] = sum;
 }
  
  /*********************************************************************
@@ -446,22 +419,23 @@ static void _convolveSeparate(
       vert_kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
     
     const int radius = vert_kernel.width / 2;
-    dim3 block(TILE_DIM, TILE_DIM);
-    dim3 grid((ncols + TILE_DIM - 1) / TILE_DIM,
-              (nrows + TILE_DIM - 1) / TILE_DIM);
+    dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+    dim3 grid((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+              (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
     
-    const int tile_height = TILE_DIM + 2 * radius;
-    size_t shared_bytes = (tile_height * TILE_DIM + tile_height * (TILE_DIM + 2*radius + 8)) * sizeof(float);
+    const int tile_vert = BLOCK_DIM_Y + 2 * radius;
+    const int tile_stride = BLOCK_DIM_X + 8;
+    size_t shared_bytes = tile_vert * tile_stride * sizeof(float);
     
     if (shared_bytes > 48 * 1024) {
-      CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
+      CUDA_CHECK(cudaFuncSetAttribute(convolveVert_Optimized,
         cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
-      CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
+      CUDA_CHECK(cudaFuncSetAttribute(convolveVert_Optimized,
         cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     }
     
     // d_img2 → d_img1
-    convolveVert_FusedTranspose<<<grid, block, shared_bytes, g_gpu.stream>>>(
+    convolveVert_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
       g_gpu.d_img2, g_gpu.d_img1, ncols, nrows, vert_kernel.width);
     
     CUDA_CHECK(cudaGetLastError());
@@ -562,25 +536,123 @@ static void _convolveSeparate(
    *gaussderiv_width = gaussderiv_kernel.width;
  }
  
- void _KLTComputeGradients(
-   _KLT_FloatImage img,
-   float sigma,
-   _KLT_FloatImage gradx,
-   _KLT_FloatImage grady)
- {
-   assert(gradx->ncols >= img->ncols);
-   assert(gradx->nrows >= img->nrows);
-   assert(grady->ncols >= img->ncols);
-   assert(grady->nrows >= img->nrows);
- 
-   if (fabs(sigma - sigma_last) > 0.05)
-     _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
-   
-   ensure_gpu_buffers(img->ncols * img->nrows * sizeof(float));
-   
-   _convolveSeparate(img, gaussderiv_kernel, gauss_kernel, gradx);
-   _convolveSeparate(img, gauss_kernel, gaussderiv_kernel, grady);
- }
+void _KLTComputeGradients(
+  _KLT_FloatImage img,
+  float sigma,
+  _KLT_FloatImage gradx,
+  _KLT_FloatImage grady)
+{
+  assert(gradx->ncols >= img->ncols);
+  assert(gradx->nrows >= img->nrows);
+  assert(grady->ncols >= img->ncols);
+  assert(grady->nrows >= img->nrows);
+
+  if (fabs(sigma - sigma_last) > 0.05)
+    _computeKernels(sigma, &gauss_kernel, &gaussderiv_kernel);
+  
+  const int ncols = img->ncols;
+  const int nrows = img->nrows;
+  const size_t nbytes = ncols * nrows * sizeof(float);
+  
+  ensure_gpu_buffers(nbytes);
+  
+  // ============ UPLOAD INPUT IMAGE ONCE ============
+  CUDA_CHECK(cudaMemcpyAsync(g_gpu.d_img1, img->data, nbytes,
+    cudaMemcpyHostToDevice, g_gpu.stream));
+  
+  // ============ COMPUTE GRADX: (gaussderiv_x * gauss_y) ============
+  {
+    // Horizontal pass with gaussderiv
+    float reversed_kernel[MAX_KERNEL_SIZE];
+    for (int i = 0; i < gaussderiv_kernel.width; i++) {
+      reversed_kernel[i] = gaussderiv_kernel.data[gaussderiv_kernel.width - 1 - i];
+    }
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+      gaussderiv_kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+    
+    int radius = gaussderiv_kernel.width / 2;
+    dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+    dim3 grid((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+              (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+    size_t shared_bytes = BLOCK_DIM_Y * (BLOCK_DIM_X + 2 * radius + 8) * sizeof(float);
+    
+    convolveHoriz_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
+      g_gpu.d_img1, g_gpu.d_img2, ncols, nrows, gaussderiv_kernel.width);
+    
+    // Vertical pass with gauss
+    for (int i = 0; i < gauss_kernel.width; i++) {
+      reversed_kernel[i] = gauss_kernel.data[gauss_kernel.width - 1 - i];
+    }
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+      gauss_kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+    
+    radius = gauss_kernel.width / 2;
+    grid = dim3((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+                (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+    shared_bytes = (BLOCK_DIM_Y + 2 * radius) * (BLOCK_DIM_X + 8) * sizeof(float);
+    
+    convolveVert_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
+      g_gpu.d_img2, g_gpu.d_img1, ncols, nrows, gauss_kernel.width);
+    
+    // Download gradx result
+    CUDA_CHECK(cudaMemcpyAsync(gradx->data, g_gpu.d_img1, nbytes,
+      cudaMemcpyDeviceToHost, g_gpu.stream));
+  }
+  
+  // ============ COMPUTE GRADY: (gauss_x * gaussderiv_y) ============
+  // Note: img is still in g_gpu.d_img1 from initial upload
+  {
+    // Horizontal pass with gauss
+    float reversed_kernel[MAX_KERNEL_SIZE];
+    for (int i = 0; i < gauss_kernel.width; i++) {
+      reversed_kernel[i] = gauss_kernel.data[gauss_kernel.width - 1 - i];
+    }
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+      gauss_kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+    
+    // Wait for gradx download to finish before reusing d_img1
+    CUDA_CHECK(cudaStreamSynchronize(g_gpu.stream));
+    
+    // Re-upload img for grady computation
+    CUDA_CHECK(cudaMemcpyAsync(g_gpu.d_img1, img->data, nbytes,
+      cudaMemcpyHostToDevice, g_gpu.stream));
+    
+    int radius = gauss_kernel.width / 2;
+    dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+    dim3 grid((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+              (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+    size_t shared_bytes = BLOCK_DIM_Y * (BLOCK_DIM_X + 2 * radius + 8) * sizeof(float);
+    
+    convolveHoriz_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
+      g_gpu.d_img1, g_gpu.d_img2, ncols, nrows, gauss_kernel.width);
+    
+    // Vertical pass with gaussderiv
+    for (int i = 0; i < gaussderiv_kernel.width; i++) {
+      reversed_kernel[i] = gaussderiv_kernel.data[gaussderiv_kernel.width - 1 - i];
+    }
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+      gaussderiv_kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+    
+    radius = gaussderiv_kernel.width / 2;
+    grid = dim3((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+                (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+    shared_bytes = (BLOCK_DIM_Y + 2 * radius) * (BLOCK_DIM_X + 8) * sizeof(float);
+    
+    convolveVert_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
+      g_gpu.d_img2, g_gpu.d_img1, ncols, nrows, gaussderiv_kernel.width);
+    
+    // Download grady result
+    CUDA_CHECK(cudaMemcpyAsync(grady->data, g_gpu.d_img1, nbytes,
+      cudaMemcpyDeviceToHost, g_gpu.stream));
+  }
+  
+  CUDA_CHECK(cudaStreamSynchronize(g_gpu.stream));
+  
+  gradx->ncols = ncols;
+  gradx->nrows = nrows;
+  grady->ncols = ncols;
+  grady->nrows = nrows;
+}
  
  void _KLTComputeSmoothedImage(
    _KLT_FloatImage img,
