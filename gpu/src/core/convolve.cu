@@ -58,11 +58,11 @@
  * Persistent Device Buffers with Streams
  *********************************************************************/
 static struct {
-  float *d_img1, *d_img2, *d_transpose;
+  float *d_img1, *d_img2;
   size_t allocated_size;
   cudaStream_t stream;
   bool initialized;
-} g_gpu = {NULL, NULL, NULL, 0, NULL, false};
+} g_gpu = {NULL, NULL, 0, NULL, false};
  
  static void ensure_gpu_buffers(size_t bytes) {
    if (!g_gpu.initialized) {
@@ -76,54 +76,20 @@ static struct {
     if (g_gpu.d_img1) {
       cudaFree(g_gpu.d_img1);
       cudaFree(g_gpu.d_img2);
-      cudaFree(g_gpu.d_transpose);
     }
     CUDA_CHECK(cudaMalloc(&g_gpu.d_img1, bytes));
     CUDA_CHECK(cudaMalloc(&g_gpu.d_img2, bytes));
-    CUDA_CHECK(cudaMalloc(&g_gpu.d_transpose, bytes));  // For transpose operations
     g_gpu.allocated_size = bytes;
   }
 }
  
 /*********************************************************************
- * EFFICIENT MATRIX TRANSPOSE WITH SHARED MEMORY
- * 
- * Uses 32x32 tiles with padding to avoid bank conflicts
- * This enables coalesced access for vertical convolution
+ * TILE SIZE FOR FUSED VERTICAL KERNEL
  *********************************************************************/
 #define TILE_DIM 32
-#define TILE_PAD 1  // Padding to avoid bank conflicts
-
-__global__ void transpose_kernel(
-  const float * __restrict__ in,
-  float * __restrict__ out,
-  int width, int height)
-{
-  __shared__ float tile[TILE_DIM][TILE_DIM + TILE_PAD];
-  
-  int x_in = blockIdx.x * TILE_DIM + threadIdx.x;
-  int y_in = blockIdx.y * TILE_DIM + threadIdx.y;
-  
-  // Read from input (coalesced)
-  if (x_in < width && y_in < height) {
-    tile[threadIdx.y][threadIdx.x] = in[y_in * width + x_in];
-  }
-  
-  __syncthreads();
-  
-  // Write to output transposed (coalesced)
-  int x_out = blockIdx.y * TILE_DIM + threadIdx.x;
-  int y_out = blockIdx.x * TILE_DIM + threadIdx.y;
-  
-  if (x_out < height && y_out < width) {
-    out[y_out * height + x_out] = tile[threadIdx.x][threadIdx.y];
-  }
-}
 
 /*********************************************************************
  * OPTIMIZED HORIZONTAL CONVOLUTION
- * 
- * Used for both horizontal and vertical convolution (via transpose)
  *********************************************************************/
 __global__ void convolveHoriz_Optimized(
    const float * __restrict__ imgin,
@@ -202,15 +168,102 @@ __global__ void convolveHoriz_Optimized(
  }
  
 /*********************************************************************
- * VERTICAL CONVOLUTION VIA TRANSPOSE
+ * FUSED VERTICAL CONVOLUTION WITH LOCAL TRANSPOSE
  * 
- * Instead of strided access, we:
- * 1. Transpose the input
- * 2. Apply horizontal convolution (coalesced access!)
- * 3. Transpose the result back
+ * Single kernel that does everything in shared memory:
+ * 1. Load tile from global memory
+ * 2. Transpose in shared memory (fast!)
+ * 3. Apply horizontal convolution to transposed data
+ * 4. Transpose result back in shared memory
+ * 5. Write to global memory
  * 
- * This makes vertical convolution as fast as horizontal!
+ * ALL transposes happen in shared memory - much faster than 3 kernels!
  *********************************************************************/
+__global__ void convolveVert_FusedTranspose(
+  const float * __restrict__ imgin,
+  float * __restrict__ imgout,
+  int ncols, int nrows,
+  int kernel_width)
+{
+  const int radius = kernel_width / 2;
+  
+  // Shared memory tiles for input, transposed, and output
+  // We use two tiles to avoid conflicts
+  extern __shared__ float s_mem[];
+  float* s_tile = s_mem;                           // First tile for load/transpose
+  float* s_conv = s_mem + (TILE_DIM + 2*radius) * (TILE_DIM + 2*radius + 8);  // Second for convolution
+  
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int bx = blockIdx.x * TILE_DIM;
+  const int by = blockIdx.y * TILE_DIM;
+  
+  // ============ STEP 1: LOAD TILE WITH HALO ============
+  // We need to load TILE_DIM + 2*radius rows
+  const int tile_height = TILE_DIM + 2 * radius;
+  
+  for (int local_row = ty; local_row < tile_height; local_row += TILE_DIM) {
+    for (int local_col = tx; local_col < TILE_DIM; local_col += TILE_DIM) {
+      int global_row = by + local_row - radius;
+      int global_col = bx + local_col;
+      
+      float val = 0.0f;
+      if (global_row >= 0 && global_row < nrows && global_col >= 0 && global_col < ncols) {
+        val = imgin[global_row * ncols + global_col];
+      }
+      s_tile[local_row * TILE_DIM + local_col] = val;
+    }
+  }
+  __syncthreads();
+  
+  // ============ STEP 2: TRANSPOSE IN SHARED MEMORY ============
+  // Transpose: rows become columns
+  // After transpose, what was a vertical strip is now a horizontal strip
+  if (tx < TILE_DIM && ty < TILE_DIM) {
+    for (int k = 0; k < tile_height; k++) {
+      int src_idx = k * TILE_DIM + ty;
+      int dst_idx = ty * tile_height + k;
+      s_conv[dst_idx] = s_tile[src_idx];
+    }
+  }
+  __syncthreads();
+  
+  // ============ STEP 3: HORIZONTAL CONVOLUTION ON TRANSPOSED DATA ============
+  if (tx < TILE_DIM && ty < TILE_DIM) {
+    int conv_col = ty;
+    int conv_row = tx;
+    
+    // Check boundaries (remember dimensions are swapped)
+    if (conv_col < radius || conv_col >= TILE_DIM - radius) {
+      // Will write zero later
+    } else {
+      float sum = 0.0f;
+      int center = conv_row * tile_height + conv_col + radius;
+      
+      #pragma unroll
+      for (int k = 0; k < kernel_width && k < 15; k++) {
+        sum += s_conv[center - radius + k] * c_kernel[k];
+      }
+      
+      // Store result back in s_tile (reusing memory)
+      s_tile[tx * TILE_DIM + ty] = sum;
+    }
+  }
+  __syncthreads();
+  
+  // ============ STEP 4: WRITE RESULT ============
+  int global_row = by + ty;
+  int global_col = bx + tx;
+  
+  if (global_row < nrows && global_col < ncols) {
+    // Apply boundary conditions
+    if (global_row < radius || global_row >= nrows - radius) {
+      imgout[global_row * ncols + global_col] = 0.0f;
+    } else {
+      imgout[global_row * ncols + global_col] = s_tile[ty * TILE_DIM + tx];
+    }
+  }
+}
  
  /*********************************************************************
   * Host Wrapper Functions
@@ -296,48 +349,31 @@ static void _convolveImageVert(
   CUDA_CHECK(cudaMemcpyAsync(g_gpu.d_img1, imgin->data, nbytes,
     cudaMemcpyHostToDevice, g_gpu.stream));
   
-  // ============ STEP 1: TRANSPOSE INPUT ============
-  // Grid for transpose: each block processes a TILE_DIM x TILE_DIM tile
-  dim3 transpose_block(TILE_DIM, TILE_DIM);
-  dim3 transpose_grid((ncols + TILE_DIM - 1) / TILE_DIM,
-                      (nrows + TILE_DIM - 1) / TILE_DIM);
-  
-  transpose_kernel<<<transpose_grid, transpose_block, 0, g_gpu.stream>>>(
-    g_gpu.d_img1, g_gpu.d_transpose, ncols, nrows);
-  
-  CUDA_CHECK(cudaGetLastError());
-  
-  // ============ STEP 2: APPLY HORIZONTAL CONVOLUTION TO TRANSPOSED DATA ============
-  // After transpose: width=nrows, height=ncols
+  // ============ SINGLE FUSED KERNEL: TRANSPOSE + CONVOLVE + TRANSPOSE ============
   const int radius = kernel.width / 2;
-  dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
-  dim3 grid((nrows + BLOCK_DIM_X - 1) / BLOCK_DIM_X,  // Note: swapped dimensions!
-            (ncols + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+  dim3 block(TILE_DIM, TILE_DIM);
+  dim3 grid((ncols + TILE_DIM - 1) / TILE_DIM,
+            (nrows + TILE_DIM - 1) / TILE_DIM);
   
-  const int tile_stride = BLOCK_DIM_X + 2 * radius + 8;
-  size_t shared_bytes = BLOCK_DIM_Y * tile_stride * sizeof(float);
+  // Calculate shared memory: two tiles (one for load, one for transposed convolution)
+  const int tile_height = TILE_DIM + 2 * radius;
+  size_t shared_bytes = (tile_height * TILE_DIM + tile_height * (TILE_DIM + 2*radius + 8)) * sizeof(float);
   
   if (shared_bytes > 48 * 1024) {
-    CUDA_CHECK(cudaFuncSetAttribute(convolveHoriz_Optimized,
+    CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
       cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
-    CUDA_CHECK(cudaFuncSetAttribute(convolveHoriz_Optimized,
+    CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
       cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   
-  // Apply horizontal convolution to transposed image
-  convolveHoriz_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
-    g_gpu.d_transpose, g_gpu.d_img2, nrows, ncols, kernel.width);
-  
-  CUDA_CHECK(cudaGetLastError());
-  
-  // ============ STEP 3: TRANSPOSE RESULT BACK ============
-  transpose_kernel<<<transpose_grid, transpose_block, 0, g_gpu.stream>>>(
-    g_gpu.d_img2, g_gpu.d_img1, nrows, ncols);
+  // Single kernel does everything!
+  convolveVert_FusedTranspose<<<grid, block, shared_bytes, g_gpu.stream>>>(
+    g_gpu.d_img1, g_gpu.d_img2, ncols, nrows, kernel.width);
   
   CUDA_CHECK(cudaGetLastError());
   
   // Copy result back to host
-  CUDA_CHECK(cudaMemcpyAsync(imgout->data, g_gpu.d_img1, nbytes,
+  CUDA_CHECK(cudaMemcpyAsync(imgout->data, g_gpu.d_img2, nbytes,
     cudaMemcpyDeviceToHost, g_gpu.stream));
   
   CUDA_CHECK(cudaStreamSynchronize(g_gpu.stream));
@@ -346,20 +382,100 @@ static void _convolveImageVert(
   imgout->nrows = nrows;
 }
  
- /*********************************************************************
-  * Separable Convolution
-  *********************************************************************/
- static void _convolveSeparate(
-   _KLT_FloatImage imgin,
-   ConvolutionKernel horiz_kernel,
-   ConvolutionKernel vert_kernel,
-   _KLT_FloatImage imgout)
- {
-   _KLT_FloatImage tmpimg = _KLTCreateFloatImage(imgin->ncols, imgin->nrows);
-   _convolveImageHoriz(imgin, horiz_kernel, tmpimg);
-   _convolveImageVert(tmpimg, vert_kernel, imgout);
-   _KLTFreeFloatImage(tmpimg);
- }
+/*********************************************************************
+ * Separable Convolution - OPTIMIZED GPU VERSION
+ * 
+ * Keep data on GPU for both passes - only 2 CPU↔GPU transfers total!
+ *********************************************************************/
+static void _convolveSeparate(
+  _KLT_FloatImage imgin,
+  ConvolutionKernel horiz_kernel,
+  ConvolutionKernel vert_kernel,
+  _KLT_FloatImage imgout)
+{
+  const int ncols = imgin->ncols;
+  const int nrows = imgin->nrows;
+  const size_t nbytes = ncols * nrows * sizeof(float);
+  
+  ensure_gpu_buffers(nbytes);
+  
+  // ============ UPLOAD INPUT ONCE ============
+  CUDA_CHECK(cudaMemcpyAsync(g_gpu.d_img1, imgin->data, nbytes,
+    cudaMemcpyHostToDevice, g_gpu.stream));
+  
+  // ============ HORIZONTAL PASS (GPU → GPU) ============
+  {
+    // Copy kernel to constant memory (reversed)
+    float reversed_kernel[MAX_KERNEL_SIZE];
+    for (int i = 0; i < horiz_kernel.width; i++) {
+      reversed_kernel[i] = horiz_kernel.data[horiz_kernel.width - 1 - i];
+    }
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+      horiz_kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+    
+    const int radius = horiz_kernel.width / 2;
+    dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+    dim3 grid((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+              (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
+    
+    const int tile_stride = BLOCK_DIM_X + 2 * radius + 8;
+    size_t shared_bytes = BLOCK_DIM_Y * tile_stride * sizeof(float);
+    
+    if (shared_bytes > 48 * 1024) {
+      CUDA_CHECK(cudaFuncSetAttribute(convolveHoriz_Optimized,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+      CUDA_CHECK(cudaFuncSetAttribute(convolveHoriz_Optimized,
+        cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    }
+    
+    // d_img1 → d_img2
+    convolveHoriz_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
+      g_gpu.d_img1, g_gpu.d_img2, ncols, nrows, horiz_kernel.width);
+    
+    CUDA_CHECK(cudaGetLastError());
+  }
+  
+  // ============ VERTICAL PASS (GPU → GPU) ============
+  {
+    // Copy kernel to constant memory (reversed)
+    float reversed_kernel[MAX_KERNEL_SIZE];
+    for (int i = 0; i < vert_kernel.width; i++) {
+      reversed_kernel[i] = vert_kernel.data[vert_kernel.width - 1 - i];
+    }
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+      vert_kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+    
+    const int radius = vert_kernel.width / 2;
+    dim3 block(TILE_DIM, TILE_DIM);
+    dim3 grid((ncols + TILE_DIM - 1) / TILE_DIM,
+              (nrows + TILE_DIM - 1) / TILE_DIM);
+    
+    const int tile_height = TILE_DIM + 2 * radius;
+    size_t shared_bytes = (tile_height * TILE_DIM + tile_height * (TILE_DIM + 2*radius + 8)) * sizeof(float);
+    
+    if (shared_bytes > 48 * 1024) {
+      CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
+      CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
+        cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    }
+    
+    // d_img2 → d_img1
+    convolveVert_FusedTranspose<<<grid, block, shared_bytes, g_gpu.stream>>>(
+      g_gpu.d_img2, g_gpu.d_img1, ncols, nrows, vert_kernel.width);
+    
+    CUDA_CHECK(cudaGetLastError());
+  }
+  
+  // ============ DOWNLOAD RESULT ONCE ============
+  CUDA_CHECK(cudaMemcpyAsync(imgout->data, g_gpu.d_img1, nbytes,
+    cudaMemcpyDeviceToHost, g_gpu.stream));
+  
+  CUDA_CHECK(cudaStreamSynchronize(g_gpu.stream));
+  
+  imgout->ncols = ncols;
+  imgout->nrows = nrows;
+}
  
  /*********************************************************************
   * Kernel Computation (unchanged from original)
@@ -487,7 +603,6 @@ void _KLTCleanupGPU() {
   if (g_gpu.initialized) {
     if (g_gpu.d_img1) cudaFree(g_gpu.d_img1);
     if (g_gpu.d_img2) cudaFree(g_gpu.d_img2);
-    if (g_gpu.d_transpose) cudaFree(g_gpu.d_transpose);
     cudaStreamDestroy(g_gpu.stream);
     g_gpu.initialized = false;
   }
