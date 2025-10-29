@@ -122,40 +122,12 @@
      const float* row_ptr = &imgin[global_row * ncols];
      float* s_row = &s_tile[row * tile_stride];
      
-     // VECTORIZED LOAD: Process 4 floats at a time
-     int vec_loads = (total_cols) / 4;
-     for (int v = tx; v < vec_loads; v += tile_width) {
-     int global_col = tile_start_col + v * 4;
-     int local_start = v * 4;
-     
-     // ADD THIS LINE:
-     if (local_start + 3 >= tile_stride) break;  // ← Prevent shared memory overflow
-     
-     if (global_col >= 0 && global_col + 3 < ncols &&
-         ((size_t)&row_ptr[global_col] % 16 == 0)) {
-         // Aligned vectorized load
-     float4 data = __ldg((const float4*)(&row_ptr[global_col]));
-         s_row[v * 4 + 0] = data.x;
-         s_row[v * 4 + 1] = data.y;
-         s_row[v * 4 + 2] = data.z;
-         s_row[v * 4 + 3] = data.w;
-       } else {
-         // Boundary handling - scalar loads with bounds check
-         for (int i = 0; i < 4; i++) {
-           int col = global_col + i;
-           s_row[v * 4 + i] = (col >= 0 && col < ncols) ? row_ptr[col] : 0.0f;
-         }
-       }
-     }
-     
-     // SCALAR LOAD: Handle remaining elements
-     int remaining_start = vec_loads * 4;
-     for (int local_col = remaining_start + tx; local_col < total_cols; local_col += tile_width) {
-       int global_col = tile_start_col + local_col;
-       s_row[local_col] = (global_col >= 0 && global_col < ncols) ? 
-                           row_ptr[global_col] : 0.0f;
-     }
-   }
+    // Load tile data: each thread handles multiple elements
+    for (int local_col = tx; local_col < total_cols; local_col += tile_width) {
+      int global_col = tile_start_col + local_col;
+      s_row[local_col] = (global_col >= 0 && global_col < ncols) ? row_ptr[global_col] : 0.0f;
+    }
+  }
    __syncthreads();
    
    // ============ PHASE 2: COMPUTE CONVOLUTION ============
@@ -270,20 +242,26 @@
  /*********************************************************************
   * Host Wrapper Functions
   *********************************************************************/
- static void _convolveImageHoriz(
-   _KLT_FloatImage imgin,
-   ConvolutionKernel kernel,
-   _KLT_FloatImage imgout)
- {
-   const int ncols = imgin->ncols;
-   const int nrows = imgin->nrows;
-   const size_t nbytes = ncols * nrows * sizeof(float);
-   
-   ensure_gpu_buffers(nbytes);
-   
-   // Copy kernel to constant memory
-   CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, kernel.data, 
-     kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+static void _convolveImageHoriz(
+  _KLT_FloatImage imgin,
+  ConvolutionKernel kernel,
+  _KLT_FloatImage imgout)
+{
+  const int ncols = imgin->ncols;
+  const int nrows = imgin->nrows;
+  const size_t nbytes = ncols * nrows * sizeof(float);
+  
+  ensure_gpu_buffers(nbytes);
+  
+  // Copy kernel to constant memory (reversed to match CPU convention)
+  // CPU applies kernel in reverse: kernel.data[width-1] at left, kernel.data[0] at right
+  // GPU applies forward: c_kernel[0] at left, c_kernel[width-1] at right
+  float reversed_kernel[MAX_KERNEL_SIZE];
+  for (int i = 0; i < kernel.width; i++) {
+    reversed_kernel[i] = kernel.data[kernel.width - 1 - i];
+  }
+  CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel, 
+    kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
    
    // Copy input to device
    CUDA_CHECK(cudaMemcpyAsync(g_gpu.d_img1, imgin->data, nbytes,
@@ -322,20 +300,24 @@
    imgout->nrows = nrows;
  }
  
- static void _convolveImageVert(
-   _KLT_FloatImage imgin,
-   ConvolutionKernel kernel,
-   _KLT_FloatImage imgout)
- {
-   const int ncols = imgin->ncols;
-   const int nrows = imgin->nrows;
-   const size_t nbytes = ncols * nrows * sizeof(float);
-   
-   ensure_gpu_buffers(nbytes);
-   
-   // Copy kernel to constant memory
-   CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, kernel.data,
-     kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
+static void _convolveImageVert(
+  _KLT_FloatImage imgin,
+  ConvolutionKernel kernel,
+  _KLT_FloatImage imgout)
+{
+  const int ncols = imgin->ncols;
+  const int nrows = imgin->nrows;
+  const size_t nbytes = ncols * nrows * sizeof(float);
+  
+  ensure_gpu_buffers(nbytes);
+  
+  // Copy kernel to constant memory (reversed to match CPU convention)
+  float reversed_kernel[MAX_KERNEL_SIZE];
+  for (int i = 0; i < kernel.width; i++) {
+    reversed_kernel[i] = kernel.data[kernel.width - 1 - i];
+  }
+  CUDA_CHECK(cudaMemcpyToSymbolAsync(c_kernel, reversed_kernel,
+    kernel.width * sizeof(float), 0, cudaMemcpyHostToDevice, g_gpu.stream));
    
    // Copy input to device
    CUDA_CHECK(cudaMemcpyAsync(g_gpu.d_img1, imgin->data, nbytes,
