@@ -649,8 +649,8 @@ __global__ void convolveVert_Optimized(
     radius = gaussderiv_kernel.width / 2;
     grid = dim3((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
                 (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
-    tile_vert = BLOCK_DIM_Y + 2 * radius;
-    shared_bytes = (tile_vert * (BLOCK_DIM_X + 1) + BLOCK_DIM_X * (tile_vert + 1)) * sizeof(float);
+    int tile_vert_grady = BLOCK_DIM_Y + 2 * radius;
+    shared_bytes = (tile_vert_grady * (BLOCK_DIM_X + 1) + BLOCK_DIM_X * (tile_vert_grady + 1)) * sizeof(float);
     
     convolveVert_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
       g_gpu.d_img1, g_gpu.d_img2, ncols, nrows, gaussderiv_kernel.width);
