@@ -128,7 +128,8 @@ __global__ void convolveHoriz_Optimized(
       int global_col = tile_start_col + v * 4;
       
       // Check if entire float4 is in bounds
-      if (global_col >= 0 && global_col + 3 < ncols) {
+      if (global_col >= 0 && global_col + 3 < ncols &&
+		 ((size_t)&row_ptr[global_col] % 16 == 0)) {
         // Aligned vectorized load
         float4 data = __ldg((const float4*)(&row_ptr[global_col]));
         s_row[v * 4 + 0] = data.x;
