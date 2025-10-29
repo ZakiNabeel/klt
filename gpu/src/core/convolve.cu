@@ -322,25 +322,26 @@ static void _convolveImageVert(
   CUDA_CHECK(cudaMemcpyAsync(g_gpu.d_img1, imgin->data, nbytes,
     cudaMemcpyHostToDevice, g_gpu.stream));
   
-  // ============ SINGLE FUSED KERNEL: TRANSPOSE + CONVOLVE + TRANSPOSE ============
+  // ============ VERTICAL CONVOLUTION ============
   const int radius = kernel.width / 2;
-  dim3 block(TILE_DIM, TILE_DIM);
-  dim3 grid((ncols + TILE_DIM - 1) / TILE_DIM,
-            (nrows + TILE_DIM - 1) / TILE_DIM);
+  dim3 block(BLOCK_DIM_X, BLOCK_DIM_Y);
+  dim3 grid((ncols + BLOCK_DIM_X - 1) / BLOCK_DIM_X,
+            (nrows + BLOCK_DIM_Y - 1) / BLOCK_DIM_Y);
   
-  // Calculate shared memory: two tiles (one for load, one for transposed convolution)
-  const int tile_height = TILE_DIM + 2 * radius;
-  size_t shared_bytes = (tile_height * TILE_DIM + tile_height * (TILE_DIM + 2*radius + 8)) * sizeof(float);
+  // Calculate shared memory
+  const int tile_vert = BLOCK_DIM_Y + 2 * radius;
+  const int tile_stride = BLOCK_DIM_X + 8;
+  size_t shared_bytes = tile_vert * tile_stride * sizeof(float);
   
   if (shared_bytes > 48 * 1024) {
-    CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
+    CUDA_CHECK(cudaFuncSetAttribute(convolveVert_Optimized,
       cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
-    CUDA_CHECK(cudaFuncSetAttribute(convolveVert_FusedTranspose,
+    CUDA_CHECK(cudaFuncSetAttribute(convolveVert_Optimized,
       cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   
-  // Single kernel does everything!
-  convolveVert_FusedTranspose<<<grid, block, shared_bytes, g_gpu.stream>>>(
+  // Vertical convolution
+  convolveVert_Optimized<<<grid, block, shared_bytes, g_gpu.stream>>>(
     g_gpu.d_img1, g_gpu.d_img2, ncols, nrows, kernel.width);
   
   CUDA_CHECK(cudaGetLastError());
